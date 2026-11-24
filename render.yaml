@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: taxmitra
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: RETRIEVAL_MODE
+        value: hybrid+rerank
+      - key: PORT
+        value: 8000
+      - key: HOST
+        value: 0.0.0.0
