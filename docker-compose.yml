@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  taxmitra:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: taxmitra_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=INFO
+      - RATE_LIMIT_PER_MINUTE=60
+    volumes:
+      - ./data/chroma_db:/app/data/chroma_db
+    restart: unless-stopped
