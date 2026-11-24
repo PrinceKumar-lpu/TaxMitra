@@ -43,6 +43,25 @@ class ToolCallRecord(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000, description="User prompt or tax query")
     session_id: Optional[str] = Field(default=None, description="Session ID for conversation and financial profile continuity")
+    retrieval_mode: Optional[Literal["dense", "hybrid", "hybrid+rerank"]] = Field(
+        default=None,
+        description="Optional override for retrieval mode ('dense', 'hybrid', 'hybrid+rerank')"
+    )
+
+
+class FeedbackRequest(BaseModel):
+    session_id: Optional[str] = None
+    query: str = Field(description="The question asked by user")
+    bot_answer: str = Field(description="The response returned by TaxMitra")
+    rating: Literal["up", "down"] = Field(description="Feedback score: 'up' or 'down'")
+    comment: Optional[str] = Field(default=None, description="Optional user review / comment")
+    retrieval_mode: Optional[str] = Field(default="hybrid+rerank", description="Retrieval mode used during turn")
+
+
+class FeedbackResponse(BaseModel):
+    id: int
+    status: str
+    message: str
 
 
 class ChatResponse(BaseModel):

@@ -19,6 +19,8 @@ from app.schemas import ChatResponse, SourceCitation, ToolCallRecord
 from app.services.tools import calculate_tax, compare_regimes
 from app.services.rag import rag_service
 from app.memory import memory_manager, SessionState
+from app.services.guardrails import check_prompt_safety, sanitize_retrieved_context, get_low_confidence_fallback
+from app.services.observability import log_structured_event, metrics_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -134,24 +136,56 @@ class LLMService:
         else:
             raise ValueError(f"Unknown tool name: {name}")
 
-    def chat(self, user_message: str, session_id: Optional[str] = None) -> ChatResponse:
+    def chat(
+        self,
+        user_message: str,
+        session_id: Optional[str] = None,
+        retrieval_mode: Optional[str] = None
+    ) -> ChatResponse:
         """
         Primary orchestrator for /chat.
-        1. Retrieve session memory & user profile.
-        2. Query ChromaDB for top-3 relevant context chunks.
-        3. Invoke Gemini with tool calling enabled.
-        4. Execute tool calls deterministically.
-        5. Generate validated JSON response with 1 retry fallback.
+        1. Guardrail check (prompt injection & domain boundaries).
+        2. Retrieve session memory & user profile.
+        3. Query knowledge base via configurable retrieval mode (dense / hybrid / hybrid+rerank).
+        4. Invoke Gemini with tool calling enabled or offline fallback.
+        5. Structured logging & metrics recording.
         """
+        import time
+        start_time = time.time()
+        effective_mode = retrieval_mode or rag_service.default_mode
+
         session = memory_manager.get_or_create_session(session_id)
         effective_session_id = session.session_id
+
+        # Step 0: Security & Guardrail Check
+        guard_result = check_prompt_safety(user_message)
+        if not guard_result.is_safe:
+            metrics_tracker.record_request(
+                latency_ms=(time.time() - start_time) * 1000,
+                success=True,
+                retrieval_mode=effective_mode,
+                rejected_by_guardrail=True
+            )
+            log_structured_event("guardrail_rejection", {
+                "session_id": effective_session_id,
+                "reason": guard_result.reason,
+                "query": user_message
+            })
+            return ChatResponse(
+                session_id=effective_session_id,
+                answer=guard_result.rejection_response,
+                sources=[],
+                tool_calls=[],
+                confidence="low"
+            )
 
         # Update session memory
         memory_manager.add_user_message(effective_session_id, user_message)
 
-        # Step 1: RAG Retrieval
-        retrieved_chunks = rag_service.retrieve(user_message, top_k=3)
-        context_str = rag_service.format_context_for_llm(retrieved_chunks)
+        # Step 1: Configurable Retrieval (dense / hybrid / hybrid+rerank)
+        retrieved_chunks = rag_service.retrieve(user_message, top_k=3, mode=effective_mode)
+        raw_context_str = rag_service.format_context_for_llm(retrieved_chunks)
+        context_str = sanitize_retrieved_context(raw_context_str)
         source_citations = rag_service.to_source_citations(retrieved_chunks)
 
         # Build prompt augmenting profile and retrieved docs
@@ -165,7 +199,26 @@ class LLMService:
         # Check if API key is mock or missing
         if not self.api_key or self.api_key == "your_gemini_api_key_here":
             logger.warning("No real GEMINI_API_KEY detected. Running fallback offline response.")
-            return self._offline_fallback_response(user_message, effective_session_id, retrieved_chunks, source_citations)
+            resp = self._offline_fallback_response(
+                user_message, effective_session_id, retrieved_chunks, source_citations
+            )
+            elapsed_ms = (time.time() - start_time) * 1000
+            tools_used = [t.tool_name for t in resp.tool_calls]
+            metrics_tracker.record_request(
+                latency_ms=elapsed_ms,
+                success=True,
+                retrieval_mode=effective_mode,
+                tools_used=tools_used
+            )
+            log_structured_event("chat_turn", {
+                "session_id": effective_session_id,
+                "latency_ms": round(elapsed_ms, 2),
+                "retrieval_mode": effective_mode,
+                "chunks_retrieved": len(retrieved_chunks),
+                "tool_calls": tools_used,
+                "confidence": resp.confidence
+            })
+            return resp
 
         tool_call_records: List[ToolCallRecord] = []
 
@@ -217,18 +270,16 @@ class LLMService:
                     system_instruction=SYSTEM_PROMPT + "\nOutput MUST be valid JSON only."
                 )
             else:
-                # Direct factual question answered via RAG context
                 final_resp = self._parse_or_retry_json(response.text if hasattr(response, "text") else "")
 
-            # Determine confidence
             confidence = final_resp.get("confidence", "high")
             if not retrieved_chunks and not tool_call_records:
                 confidence = "low"
 
-            ans_text = final_resp.get("answer", "No answer generated.")
+            ans_text = final_resp.get("answer", get_low_confidence_fallback())
             memory_manager.add_model_message(effective_session_id, ans_text)
 
-            return ChatResponse(
+            chat_resp = ChatResponse(
                 session_id=effective_session_id,
                 answer=ans_text,
                 sources=source_citations,
@@ -236,9 +287,35 @@ class LLMService:
                 confidence=confidence
             )
 
+            elapsed_ms = (time.time() - start_time) * 1000
+            tools_used = [t.tool_name for t in tool_call_records]
+            metrics_tracker.record_request(
+                latency_ms=elapsed_ms,
+                success=True,
+                retrieval_mode=effective_mode,
+                tools_used=tools_used
+            )
+            log_structured_event("chat_turn", {
+                "session_id": effective_session_id,
+                "latency_ms": round(elapsed_ms, 2),
+                "retrieval_mode": effective_mode,
+                "chunks_retrieved": len(retrieved_chunks),
+                "tool_calls": tools_used,
+                "confidence": confidence
+            })
+            return chat_resp
+
         except Exception as e:
             logger.error(f"Error during Gemini interaction: {e}", exc_info=True)
-            return self._offline_fallback_response(user_message, effective_session_id, retrieved_chunks, source_citations, error=str(e))
+            fallback = self._offline_fallback_response(
+                user_message, effective_session_id, retrieved_chunks, source_citations, error=str(e)
+            )
+            metrics_tracker.record_request(
+                latency_ms=(time.time() - start_time) * 1000,
+                success=False,
+                retrieval_mode=effective_mode
+            )
+            return fallback
 
     def _call_with_retry(self, prompt: str, system_instruction: str) -> Dict[str, Any]:
         """Calls Gemini and retries once if invalid JSON is returned."""
@@ -370,7 +447,7 @@ class LLMService:
 
         return ChatResponse(
             session_id=session_id,
-            answer="I am not sure based on the official Indian tax documents currently in my knowledge base, and I cannot invent tax rules.",
+            answer=get_low_confidence_fallback(),
             sources=[],
             tool_calls=[],
             confidence="low"

@@ -29,11 +29,15 @@ from app.schemas import (
     ChatResponse,
     CalculateTaxRequest,
     CompareRegimesRequest,
-    DeductionDetails
+    DeductionDetails,
+    FeedbackRequest,
+    FeedbackResponse
 )
 from app.services.tools import calculate_tax, compare_regimes
 from app.services.llm import llm_service
-from app.services.rag import get_collection
+from app.services.rag import get_collection, rag_service
+from app.services.observability import metrics_tracker, log_structured_event
+from app.services.feedback import record_feedback, get_all_feedback, FeedbackItem
 
 # Configure logging
 logging.basicConfig(
@@ -124,18 +128,56 @@ async def health_check():
     }
 
 
+@app.get("/metrics", tags=["Observability"])
+async def get_metrics():
+    """Returns real-time service observability metrics."""
+    return metrics_tracker.get_summary()
+
+
+@app.post("/feedback", response_model=FeedbackResponse, tags=["Feedback Loop"])
+async def submit_feedback(payload: FeedbackRequest):
+    """Stores user thumbs-up/down ratings and reviews in SQLite."""
+    try:
+        row_id = record_feedback(
+            FeedbackItem(
+                session_id=payload.session_id,
+                query=payload.query,
+                bot_answer=payload.bot_answer,
+                rating=payload.rating,
+                comment=payload.comment,
+                retrieval_mode=payload.retrieval_mode
+            )
+        )
+        metrics_tracker.record_feedback(payload.rating)
+        log_structured_event("user_feedback", {
+            "feedback_id": row_id,
+            "session_id": payload.session_id,
+            "rating": payload.rating
+        })
+        return FeedbackResponse(
+            id=row_id,
+            status="success",
+            message="Thank you! Your feedback helps TaxMitra continuously improve."
+        )
+    except Exception as e:
+        logger.error(f"Error saving feedback: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save feedback.")
+
+
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(rate_limiter)], tags=["AI Assistant"])
 async def chat_endpoint(payload: ChatRequest):
     """
     Main conversational endpoint:
-    - RAG context retrieval from tax docs
+    - Multi-layer guardrail check (injection defense, domain bounds)
+    - Hybrid RAG context retrieval (dense + BM25 + RRF + reranking)
     - Deterministic tool execution for tax calculations
     - Conversation & profile memory tracking
     """
     try:
         response = llm_service.chat(
             user_message=payload.message,
-            session_id=payload.session_id
+            session_id=payload.session_id,
+            retrieval_mode=payload.retrieval_mode
         )
         return response
     except Exception as e:

@@ -33,6 +33,15 @@
             </div>
         </div>
         <div class="flex items-center space-x-4">
+            <!-- Mode Selector -->
+            <div class="flex items-center bg-indigo-800/80 rounded-lg px-2 py-1 text-xs text-indigo-100 border border-indigo-600">
+                <span class="mr-1.5 text-indigo-300"><i class="fa-solid fa-sliders"></i> Mode:</span>
+                <select id="retrieval-mode" class="bg-indigo-900 text-white rounded px-1.5 py-0.5 focus:outline-none cursor-pointer">
+                    <option value="hybrid+rerank" selected>Hybrid + Re-rank</option>
+                    <option value="hybrid">Hybrid (Dense + BM25)</option>
+                    <option value="dense">Dense Only</option>
+                </select>
+            </div>
             <span id="health-badge" class="px-2.5 py-1 text-xs rounded-full bg-emerald-500 text-white font-medium flex items-center gap-1.5">
                 <span class="w-2 h-2 rounded-full bg-white animate-pulse"></span> Ready
             </span>
@@ -187,10 +196,15 @@
             document.getElementById("chat-loading").classList.remove("hidden");
 
             try {
+                const mode = document.getElementById("retrieval-mode").value;
                 const response = await fetch("/chat", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ message: message, session_id: currentSessionId })
+                    body: JSON.stringify({
+                        message: message,
+                        session_id: currentSessionId,
+                        retrieval_mode: mode
+                    })
                 });
 
                 if (!response.ok) {
@@ -287,6 +301,18 @@
                     </div>
                     ${toolBadgeHtml}
                     ${sourcesHtml}
+                    <!-- Feedback Loop Action Bar -->
+                    <div class="pt-2 mt-2 border-t border-slate-200 flex items-center justify-between text-xs text-slate-500">
+                        <span class="text-[11px]">Was this response accurate & helpful?</span>
+                        <div class="flex items-center space-x-2">
+                            <button onclick="submitFeedback('${data.session_id}', 'up', this)" class="hover:text-emerald-600 hover:bg-emerald-50 px-2 py-0.5 rounded transition">
+                                <i class="fa-regular fa-thumbs-up"></i> Yes
+                            </button>
+                            <button onclick="submitFeedback('${data.session_id}', 'down', this)" class="hover:text-rose-600 hover:bg-rose-50 px-2 py-0.5 rounded transition">
+                                <i class="fa-regular fa-thumbs-down"></i> No
+                            </button>
+                        </div>
+                    </div>
                 </div>
             `;
             chatBox.appendChild(div);
@@ -307,6 +333,27 @@
             `;
             chatBox.appendChild(div);
             chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        async function submitFeedback(sessionId, rating, btnElem) {
+            const container = btnElem.parentElement;
+            container.innerHTML = `<span class="text-[11px] text-indigo-600 font-medium">Recording feedback...</span>`;
+            try {
+                await fetch("/feedback", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        query: "User chat interaction",
+                        bot_answer: "Refer to session interaction",
+                        rating: rating,
+                        retrieval_mode: document.getElementById("retrieval-mode").value
+                    })
+                });
+                container.innerHTML = `<span class="text-[11px] text-emerald-600 font-medium"><i class="fa-solid fa-check"></i> Thank you!</span>`;
+            } catch (e) {
+                container.innerHTML = `<span class="text-[11px] text-slate-400">Feedback noted.</span>`;
+            }
         }
 
         function escapeHtml(text) {
